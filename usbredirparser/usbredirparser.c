@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <unistd.h>
 #include "usbredirproto-compat.h"
 #include "usbredirparser.h"
 #include "usbredirfilter.h"
@@ -1063,11 +1064,20 @@ int usbredirparser_do_write(struct usbredirparser *parser_pub)
             break;
 
         w = wbuf->len - wbuf->pos;
-        w = parser->callb.write_func(parser->callb.priv,
-                                     wbuf->buf + wbuf->pos, w);
-        if (w <= 0) {
-            ret = w;
-            break;
+        if (w > 0) {
+            w = parser->callb.write_func(parser->callb.priv,
+                                        wbuf->buf + wbuf->pos, w);
+            if (w < 0) {
+                ret = -1;
+                break;
+            }
+            if (w == 0) {
+                UNLOCK(parser);
+                WARNING("usbredirparser_do_write : 0 bytes written out of %d, sleeping for 0.1sec\n", wbuf->len - wbuf->pos);
+                usleep(100000);
+                LOCK(parser);
+                continue;
+            }
         }
 
         /* See usbredirparser_write documentation */
