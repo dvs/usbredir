@@ -379,6 +379,10 @@ int usbredirparser_serialize(struct usbredirparser *parser,
 int usbredirparser_unserialize(struct usbredirparser *parser_pub,
                                uint8_t *state, int len);
 
+
+void usbredirparser_save_peer_caps(struct usbredirparser *parser_pub, uint32_t *ptr);
+void usbredirparser_restore_peer_caps(struct usbredirparser *parser_pub, uint32_t *ptr);
+
 #ifdef __cplusplus
 }
 #endif

@@ -38,17 +38,26 @@
 #include <netinet/in.h>
 #include "usbredirhost.h"
 
-
 #define SERVER_VERSION "usbredirserver " PACKAGE_VERSION
 
 static int verbose = usbredirparser_info;
-static int client_fd, running = 1;
+static int client_fd = -1, running = 1;
+static int wait_mode = 0;
+static int wait_timeout = 3;
 static libusb_context *ctx;
 static struct usbredirhost *host;
+
+static int usbvendor  = -1;
+static int usbproduct = -1;
+static int usbbus     = -1;
+static int usbaddr    = -1;
+static libusb_device_handle *handle = NULL;
 
 static const struct option longopts[] = {
     { "port", required_argument, NULL, 'p' },
     { "verbose", required_argument, NULL, 'v' },
+    { "wait", no_argument, NULL, 'w' },
+    { "wait-timeout", required_argument, NULL, 't' },
     { "help", no_argument, NULL, 'h' },
     { NULL, 0, NULL, 0 }
 };
@@ -59,9 +68,38 @@ static void usbredirserver_log(void *priv, int level, const char *msg)
         fprintf(stderr, "%s\n", msg);
 }
 
+static void
+#if defined __GNUC__
+__attribute__((format(printf, 2, 3)))
+#endif
+va_log(int level, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    int n;
+
+    n = sprintf(buf, "usbredirserver: ");
+    va_start(ap, fmt);
+    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+
+    usbredirserver_log(NULL, level, buf);
+}
+
+#ifdef ERROR /* defined on WIN32 */
+#undef ERROR
+#endif
+#define ERROR(...)   va_log(usbredirparser_error, __VA_ARGS__)
+#define WARNING(...) va_log(usbredirparser_warning, __VA_ARGS__)
+#define INFO(...)    va_log(usbredirparser_info, __VA_ARGS__)
+#define DEBUG(...)   va_log(usbredirparser_debug, __VA_ARGS__)
+
 static int usbredirserver_read(void *priv, uint8_t *data, int count)
 {
-    int r = read(client_fd, data, count);
+    int r;
+    errno = 0;
+    r = read(client_fd, data, count);
+    DEBUG("usbredirserver_read : client_fd = %d, read bytes = %d/%d, errno = %d", client_fd, r, count, errno);
     if (r < 0) {
         if (errno == EAGAIN)
             return 0;
@@ -76,7 +114,10 @@ static int usbredirserver_read(void *priv, uint8_t *data, int count)
 
 static int usbredirserver_write(void *priv, uint8_t *data, int count)
 {
-    int r = write(client_fd, data, count);
+    int r;
+    errno = 0;
+    r = write(client_fd, data, count);
+    DEBUG("usbredirserver_write : client_fd = %d, write bytes = %d/%d, errno = %d", client_fd, r, count, errno);
     if (r < 0) {
         if (errno == EAGAIN)
             return 0;
@@ -93,7 +134,7 @@ static int usbredirserver_write(void *priv, uint8_t *data, int count)
 static void usage(int exit_code, char *argv0)
 {
     fprintf(exit_code? stderr:stdout,
-        "Usage: %s [-p|--port <port>] [-v|--verbose <0-5>] <usbbus-usbaddr|vendorid:prodid>\n",
+        "Usage: %s [-p|--port <port>] [-v|--verbose <0-5>] [-w|--wait] [-t|--wait-timeout #] <usbbus-usbaddr|vendorid:prodid>\n",
         argv0);
     exit(exit_code);
 }
@@ -104,6 +145,36 @@ static void invalid_usb_device_id(char *usb_device_id, char *argv0)
     usage(1, argv0);
 }
 
+static void find_device()
+{
+    /* Try to find the specified usb device */
+    if (usbvendor != -1) {
+        handle = libusb_open_device_with_vid_pid(ctx, usbvendor,
+                                                    usbproduct);
+        if (!handle) {
+            INFO("Could not open an usb-device with vid:pid %04x:%04x", usbvendor, usbproduct);
+        }
+    } else {
+        libusb_device **list = NULL;
+        ssize_t i, n;
+
+        n = libusb_get_device_list(ctx, &list);
+        for (i = 0; i < n; i++) {
+            if (libusb_get_bus_number(list[i]) == usbbus &&
+                    libusb_get_device_address(list[i]) == usbaddr)
+                break;
+        }
+        if (i < n) {
+            if (libusb_open(list[i], &handle) != 0) {
+                INFO("Could not open usb-device at bus-addr %d-%d", usbbus, usbaddr);
+            }
+        } else {
+            INFO("Could not find an usb-device at bus-addr %d-%d\n", usbbus, usbaddr);
+        }
+        libusb_free_device_list(list, 1);
+    }
+}
+
 static void run_main_loop(void)
 {
     const struct libusb_pollfd **pollfds = NULL;
@@ -111,7 +182,10 @@ static void run_main_loop(void)
     int i, n, nfds;
     struct timeval timeout, *timeout_p;
 
+    INFO("Starting run_main_loop...");
+    int wait_mode_state = 0;
     while (running && client_fd != -1) {
+        DEBUG("Looping in run_main_loop...");
         FD_ZERO(&readfds);
         FD_ZERO(&writefds);
 
@@ -134,10 +208,15 @@ static void run_main_loop(void)
                 nfds = pollfds[i]->fd + 1;
         }
 
+        struct timeval default_tv = {wait_timeout, 0};
         if (libusb_get_next_timeout(ctx, &timeout) == 1) {
             timeout_p = &timeout;
         } else {
-            timeout_p = NULL;
+            if (wait_mode) {
+                timeout_p = &default_tv;
+            } else {
+                timeout_p = NULL;
+            }
         }
         n = select(nfds, &readfds, &writefds, NULL, timeout_p);
         if (n == -1) {
@@ -150,20 +229,28 @@ static void run_main_loop(void)
         memset(&timeout, 0, sizeof(timeout));
         if (n == 0) {
             libusb_handle_events_timeout(ctx, &timeout);
-            continue;
+            if (!wait_mode) {
+                continue;
+            }
         }
 
         if (FD_ISSET(client_fd, &readfds)) {
-            if (usbredirhost_read_guest_data(host)) {
+            DEBUG("before usbredirhost_read_guest_data(host=0%lx)", (unsigned long) host);
+            int error = usbredirhost_read_guest_data(host);
+            if (error) {
+                DEBUG("usbredirhost_read_guest_data: error = %d", error);
                 break;
             }
         }
         /* usbredirhost_read_guest_data may have detected client disconnect */
-        if (client_fd == -1)
+        if (client_fd == -1) {
             break;
+        }
 
         if (FD_ISSET(client_fd, &writefds)) {
-            if (usbredirhost_write_guest_data(host)) {
+            int error = usbredirhost_write_guest_data(host);
+            if (error) {
+                DEBUG("usbredirhost_write_guest_data: error = %d", error);
                 break;
             }
         }
@@ -175,7 +262,63 @@ static void run_main_loop(void)
                 break;
             }
         }
+        if (wait_mode) {
+            int disconnected = usbredirhost_is_disconnected(host);
+            DEBUG("disconnected = %d, wait_mode_state = %d", disconnected, wait_mode_state);
+            if (disconnected == 0 && wait_mode_state == 0) {
+                wait_mode_state = 1; /* the device is connected now */
+                continue;
+            }
+            if (wait_mode_state == 1 && client_fd != -1) {
+                if (n == 0) {
+                    /* timeout in select, check libusb for presence of the device */
+                    int config;
+                    int error = libusb_get_configuration(handle, &config);
+                    DEBUG("libusb_get_configuration: error = %d", error);
+                    if (error && disconnected == 0) {
+                        usbredirhost_disconnect(host);
+                        disconnected = 1;
+                    }
+                }
+                if (disconnected == 1) {
+                    usbredirhost_write_guest_data(host);
+                    sleep(wait_timeout);
+                    usbredirhost_read_guest_data(host);
+                    while(client_fd != -1) {
+                        libusb_exit(ctx);
+                        if (libusb_init(&ctx)) {
+                            fprintf(stderr, "Could not init libusb\n");
+                            exit(1);
+                        }
+                        libusb_set_debug(ctx, verbose);
+
+                        find_device();
+
+                        if (!handle) {
+                            if (usbvendor != -1) {
+                                INFO("Waiting for vid:pid %04x:%04x ...", usbvendor, usbproduct);
+                            } else {
+                                INFO("Waiting for usb-device at bus-addr %d-%d ...", usbbus, usbaddr);
+                            }
+                            sleep(wait_timeout);
+                        } else {
+                            INFO("opened handle = 0x%lx", (long unsigned) handle);
+                            uint32_t peer_caps[USB_REDIR_CAPS_SIZE];
+                            usbredirhost_save_caps(host, peer_caps);
+                            host = usbredirhost_open(ctx, handle, usbredirserver_log,
+                                                    usbredirserver_read, usbredirserver_write,
+                                                    NULL, SERVER_VERSION, verbose, usbredirparser_fl_no_hello);
+                            usbredirhost_restore_caps_and_send_device_connect(host, peer_caps);
+                            usbredirhost_write_guest_data(host);
+                            break;
+                        }
+                    }
+                    wait_mode_state = 0;
+                }
+            }
+        }
     }
+    INFO("Leaving run_main_loop, client_fd = %d.", client_fd);
     if (client_fd != -1) { /* Broken out of the loop because of an error ? */
         close(client_fd);
         client_fd = -1;
@@ -192,17 +335,12 @@ int main(int argc, char *argv[])
 {
     int o, flags, server_fd = -1;
     char *endptr, *delim;
-    int port       = 4000;
-    int usbbus     = -1;
-    int usbaddr    = -1;
-    int usbvendor  = -1;
-    int usbproduct = -1;
+    int port = 4000;
     int on = 1;
     struct sockaddr_in6 serveraddr;
     struct sigaction act;
-    libusb_device_handle *handle = NULL;
 
-    while ((o = getopt_long(argc, argv, "hp:v:", longopts, NULL)) != -1) {
+    while ((o = getopt_long(argc, argv, "hwp:v:t:", longopts, NULL)) != -1) {
         switch (o) {
         case 'p':
             port = strtol(optarg, &endptr, 10);
@@ -215,6 +353,16 @@ int main(int argc, char *argv[])
             verbose = strtol(optarg, &endptr, 10);
             if (*endptr != '\0') {
                 fprintf(stderr, "Invalid value for --verbose: '%s'\n", optarg);
+                usage(1, argv[0]);
+            }
+            break;
+        case 'w':
+            wait_mode = 1;
+            break;
+        case 't':
+            wait_timeout = strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Inalid value for --wait-timeout: '%s'\n", optarg);
                 usage(1, argv[0]);
             }
             break;
@@ -299,60 +447,36 @@ int main(int argc, char *argv[])
     }
 
     while (running) {
-        client_fd = accept(server_fd, NULL, 0);
-        if (client_fd == -1) {
-            if (errno == EINTR) {
-                continue;
+        INFO("Looping in main (client_fd = %d, handle = 0x%lx)...", client_fd, (unsigned long) handle);
+        if (client_fd == -1 || !wait_mode) {
+            client_fd = accept(server_fd, NULL, 0);
+            if (client_fd == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("accept");
+                break;
             }
-            perror("accept");
-            break;
-        }
-
-        flags = fcntl(client_fd, F_GETFL);
-        if (flags == -1) {
-            perror("fcntl F_GETFL");
-            break;
-        }
-        flags = fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-        if (flags == -1) {
-            perror("fcntl F_SETFL O_NONBLOCK");
-            break;
-        }
-
-        /* Try to find the specified usb device */
-        if (usbvendor != -1) {
-            handle = libusb_open_device_with_vid_pid(ctx, usbvendor,
-                                                     usbproduct);
-            if (!handle) {
-                fprintf(stderr,
-                    "Could not open an usb-device with vid:pid %04x:%04x\n",
-                    usbvendor, usbproduct);
+            flags = fcntl(client_fd, F_GETFL);
+            if (flags == -1) {
+                perror("fcntl F_GETFL");
+                break;
+            }
+            flags = fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+            if (flags == -1) {
+                perror("fcntl F_SETFL O_NONBLOCK");
+                break;
             }
         } else {
-            libusb_device **list = NULL;
-            ssize_t i, n;
-
-            n = libusb_get_device_list(ctx, &list);
-            for (i = 0; i < n; i++) {
-                if (libusb_get_bus_number(list[i]) == usbbus &&
-                        libusb_get_device_address(list[i]) == usbaddr)
-                    break;
-            }
-            if (i < n) {
-                if (libusb_open(list[i], &handle) != 0) {
-                    fprintf(stderr,
-                        "Could not open usb-device at bus-addr %d-%d\n",
-                        usbbus, usbaddr);
-                }
-            } else {
-                fprintf(stderr,
-                    "Could not find an usb-device at bus-addr %d-%d\n",
-                    usbbus, usbaddr);
-            }
-            libusb_free_device_list(list, 1);
+            sleep(wait_timeout);
         }
+
+        find_device();
+
         if (!handle) {
-            close(client_fd);
+            if (!wait_mode) {
+                close(client_fd);
+            }
             continue;
         }
 
