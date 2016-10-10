@@ -179,6 +179,11 @@ void usbredirhost_get_guest_filter(struct usbredirhost *host,
 int usbredirhost_check_device_filter(const struct usbredirfilter_rule *rules,
     int rules_count, libusb_device *dev, int flags);
 
+int usbredirhost_is_disconnected(struct usbredirhost *host);
+void usbredirhost_disconnect(struct usbredirhost *host);
+void usbredirhost_save_caps(void *priv, uint32_t *ptr);
+void usbredirhost_restore_caps_and_send_device_connect(void *priv, uint32_t *ptr);
+
 #ifdef __cplusplus
 }
 #endif

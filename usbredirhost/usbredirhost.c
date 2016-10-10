@@ -732,6 +732,10 @@ struct usbredirhost *usbredirhost_open_full(
         parser_flags |= usbredirparser_fl_write_cb_owns_buffer;
     }
 
+    if (flags & usbredirparser_fl_no_hello) {
+        parser_flags |= usbredirparser_fl_no_hello;
+    }
+
     usbredirparser_caps_set_cap(caps, usb_redir_cap_connect_device_version);
     usbredirparser_caps_set_cap(caps, usb_redir_cap_filter);
     usbredirparser_caps_set_cap(caps, usb_redir_cap_device_disconnect_ack);
@@ -757,6 +761,21 @@ struct usbredirhost *usbredirhost_open_full(
 
     return host;
 }
+
+void usbredirhost_save_caps(void *priv, uint32_t *ptr)
+{
+    struct usbredirhost *host = priv;
+    usbredirparser_save_peer_caps(host->parser, ptr);
+}
+
+void usbredirhost_restore_caps_and_send_device_connect(void *priv, uint32_t *ptr)
+{
+    struct usbredirhost *host = priv;
+    usbredirparser_restore_peer_caps(host->parser, ptr);
+    host->connect_pending = 0;
+    usbredirhost_send_device_connect(host);
+}
+
 
 void usbredirhost_close(struct usbredirhost *host)
 {
@@ -879,6 +898,16 @@ int usbredirhost_write_guest_data(struct usbredirhost *host)
 void usbredirhost_free_write_buffer(struct usbredirhost *host, uint8_t *data)
 {
     usbredirparser_free_write_buffer(host->parser, data);
+}
+
+int usbredirhost_is_disconnected(struct usbredirhost *host)
+{
+    return host->disconnected;
+}
+
+void usbredirhost_disconnect(struct usbredirhost *host)
+{
+    usbredirhost_handle_disconnect(host);
 }
 
 /**************************************************************************/

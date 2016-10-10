@@ -252,6 +252,21 @@ static int usbredirparser_using_32bits_ids(struct usbredirparser *parser_pub)
            !usbredirparser_peer_has_cap(parser_pub, usb_redir_cap_64bits_ids);
 }
 
+void usbredirparser_save_peer_caps(struct usbredirparser *parser_pub, uint32_t *ptr)
+{
+    struct usbredirparser_priv *parser =
+        (struct usbredirparser_priv *)parser_pub;
+    memcpy(ptr, parser->peer_caps, sizeof(parser->peer_caps));
+}
+
+void usbredirparser_restore_peer_caps(struct usbredirparser *parser_pub, uint32_t *ptr)
+{
+    struct usbredirparser_priv *parser =
+        (struct usbredirparser_priv *)parser_pub;
+    memcpy(parser->peer_caps, ptr, sizeof(parser->peer_caps));
+    parser->have_peer_caps = 1;
+}
+
 static void usbredirparser_handle_hello(struct usbredirparser *parser_pub,
     struct usb_redir_hello_header *hello, uint8_t *data, int data_len)
 {
@@ -782,6 +797,7 @@ static void usbredirparser_call_type_func(struct usbredirparser *parser_pub)
     else
         id = parser->header.id;
 
+    INFO("usbredirparser_call_type_func header.type : %d", parser->header.type);
     switch (parser->header.type) {
     case usb_redir_hello:
         usbredirparser_handle_hello(parser_pub,
@@ -1142,6 +1158,7 @@ static void usbredirparser_queue(struct usbredirparser *parser_pub,
         return;
     }
 
+    INFO("usbredirparser_queue type : %d", type);
     new_wbuf->buf = buf;
     new_wbuf->len = header_len + type_header_len + data_len;
 
